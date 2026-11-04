@@ -1,3 +1,4 @@
+/*
 package com.flamingo.llp.test;
 
 import com.fazecast.jSerialComm.SerialPort;
@@ -172,4 +173,4 @@ public class SerialLLPWebMonitorTest {
 
         return "{}";
     }
-}
+}*/

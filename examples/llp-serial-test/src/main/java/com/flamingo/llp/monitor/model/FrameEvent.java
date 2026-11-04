@@ -1,6 +1,6 @@
 package com.flamingo.llp.monitor.model;
 
-import com.flamingo.comm.llp.LLPFrame;
+import com.flamingo.comm.llp.core.LLPFrame;
 
 public class FrameEvent {
 

@@ -10,7 +10,7 @@ public class SerialTest {
 
         // ================= SERIAL CONFIG =================
         SerialPort port = SerialPort.getCommPort("/dev/ttyUSB0");
-        port.setBaudRate(9600);
+        port.setBaudRate(115200);
         port.setNumDataBits(8);
         port.setNumStopBits(SerialPort.ONE_STOP_BIT);
         port.setParity(SerialPort.NO_PARITY);
