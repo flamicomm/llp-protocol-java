@@ -1,12 +1,11 @@
 package com.flamingo.llp.test;
 
 import com.fazecast.jSerialComm.SerialPort;
-import com.flamingo.comm.llp.core.*;
+import com.flamingo.comm.llp.*;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 import java.util.List;
@@ -41,7 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   sendhex &lt;hex&gt;           Send raw hex bytes
  *   sendascii &lt;text&gt;        Send ASCII text
  *   sendbytes &lt;b1&gt; &lt;b2&gt;..   Send individual bytes (decimal/hex/char)
- *   llp &lt;hexpayload&gt;        Build and send LLP transport frame from hex layer-chain
+ *   llp &lt;hexpayload&gt;        Build and send an LLP frame from hex payload
  *   llpascii &lt;text&gt;         Build and send LLP frame from ASCII payload
  *   llpping                 Send a simple LLP ping frame
  *   rx                      Print RX log buffer
@@ -70,7 +69,7 @@ public class SerialLLPShell {
     private static final int MAX_RX_LOG_LINES = 200;
 
     private LLPIncrementalParser parser;
-    private LLPFrameBuilder<byte[]> llpBuilder;
+    private int llpChannel = 0;
 
     /**
      * Main entry.
@@ -171,6 +170,7 @@ public class SerialLLPShell {
                 case "sendbytes"   -> sendBytes(args);
                 case "llp"         -> sendLlpHex(args);
                 case "llpascii"    -> sendLlpAscii(args);
+                case "llpchan"     -> setLlpChannel(args);
                 case "llpping"     -> sendLlpPing();
                 case "rx"          -> showRx();
                 case "clear"       -> clearRx();
@@ -204,8 +204,9 @@ public class SerialLLPShell {
               sendbytes <b1> <b2>..  Send individual bytes (0xFF, 255, 'A')
 
             SEND LLP FRAMES
-              llp <hex>              Build LLP transport frame from layer-chain hex
-              llpascii <text>        Build LLP frame with ASCII payload
+              llp <hex>              Build an LLP frame from hex payload
+              llpascii <text>        Build an LLP frame with ASCII payload
+              llpchan <n>            Set the channel for the commands above (0-255)
               llpping                Send a ping LLP frame
 
             RECEIVE
@@ -259,11 +260,9 @@ public class SerialLLPShell {
         out = port.getOutputStream();
 
         parser = LLP.incrementalParser()
-                .maxPayloadBytes(4096)
+                .capacity(LLP.MAX_CAPACITY)
                 .timeoutMs(1000)
                 .build();
-
-        llpBuilder = LLP.frameBuilder().build();
 
         running.set(true);
         startRxThread();
@@ -352,12 +351,11 @@ public class SerialLLPShell {
             return;
         }
         String hex = String.join("", args).replaceAll("\\s+", "");
-        byte[] layerChain = HexFormat.of().parseHex(hex);
-        byte[] frame = LLPTransportFramer.buildSafe(layerChain);
+        byte[] frame = LLP.encode(llpChannel, HexFormat.of().parseHex(hex));
         out.write(frame);
         out.flush();
-        System.out.println("[TX LLP] transport=" + HexFormat.of().formatHex(frame).toUpperCase()
-                + "  layerChain=" + hex.toUpperCase());
+        System.out.println("[TX LLP] channel=" + llpChannel
+                + "  frame=" + HexFormat.of().formatHex(frame).toUpperCase());
     }
 
     private void sendLlpAscii(String[] args) throws IOException {
@@ -368,23 +366,39 @@ public class SerialLLPShell {
         }
         String text = String.join(" ", args);
         byte[] appPayload = text.getBytes(StandardCharsets.UTF_8);
-        byte[] layerChain = llpBuilder.build(ByteBuffer.wrap(appPayload));
-        byte[] frame = LLPTransportFramer.buildSafe(layerChain);
+        byte[] frame = LLP.encode(llpChannel, appPayload);
         out.write(frame);
         out.flush();
-        System.out.println("[TX LLP] transport=" + HexFormat.of().formatHex(frame).toUpperCase()
+        System.out.println("[TX LLP] channel=" + llpChannel
+                + "  frame=" + HexFormat.of().formatHex(frame).toUpperCase()
                 + "  payload=\"" + text + "\"");
     }
 
     private void sendLlpPing() throws IOException {
         ensureConnected();
-        String text = "PING";
-        byte[] appPayload = text.getBytes(StandardCharsets.UTF_8);
-        byte[] layerChain = llpBuilder.build(ByteBuffer.wrap(appPayload));
-        byte[] frame = LLPTransportFramer.buildSafe(layerChain);
+        byte[] frame = LLP.encode(llpChannel, "PING".getBytes(StandardCharsets.UTF_8));
         out.write(frame);
         out.flush();
-        System.out.println("[TX LLP PING] transport=" + HexFormat.of().formatHex(frame).toUpperCase());
+        System.out.println("[TX LLP PING] channel=" + llpChannel
+                + "  frame=" + HexFormat.of().formatHex(frame).toUpperCase());
+    }
+
+    private void setLlpChannel(String[] args) {
+        if (args.length == 0) {
+            System.out.println("LLP channel: " + llpChannel);
+            return;
+        }
+        try {
+            int value = Integer.parseInt(args[0]);
+            if (value < 0 || value > 255) {
+                System.err.println("channel must be 0..255");
+                return;
+            }
+            llpChannel = value;
+            System.out.println("LLP channel set to " + llpChannel);
+        } catch (NumberFormatException e) {
+            System.err.println("channel must be a number 0..255");
+        }
     }
 
     private void showRx() {
@@ -448,24 +462,18 @@ public class SerialLLPShell {
 
         List<LLPFrame> frames = parser.pollFrames();
         for (LLPFrame frame : frames) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("[RX LLP FRAME] crc=").append(frame.crc()).append(" nodes=").append(frame.chain().size()).append("  chain=");
-            frame.chain().visit(visitor -> visitor
-                    .on(FinalNode.class, node -> {
-                        ByteBuffer pb = node.getPayload();
-                        byte[] payload = new byte[pb.remaining()];
-                        pb.get(payload);
-                        String hex = HexFormat.of().formatHex(payload).toUpperCase();
-                        String ascii = new String(payload, StandardCharsets.UTF_8);
-                        sb.append("FinalNode{hex=").append(hex).append(" ascii=\"").append(ascii).append("\"}");
-                    })
-            );
-            logRx(sb.toString());
+            byte[] payload = frame.payloadBytes();
+            String hex = HexFormat.of().formatHex(payload).toUpperCase();
+            String ascii = new String(payload, StandardCharsets.UTF_8);
+            logRx("[RX LLP FRAME] channel=" + frame.channel()
+                    + " len=" + payload.length
+                    + " crc=0x" + Integer.toHexString(frame.crc())
+                    + " hex=" + hex + " ascii=\"" + ascii + "\"");
         }
 
-        List<TransportErrorCode> errors = parser.pollErrors();
-        for (TransportErrorCode err : errors) {
-            logRx("[RX TRANSPORT ERROR] code=0x" + Integer.toHexString(err.code())
+        List<LLPError> errors = parser.pollErrors();
+        for (LLPError err : errors) {
+            logRx("[RX LLP ERROR] " + err.wireName() + " code=" + err.code()
                     + " desc=" + err.description());
         }
 

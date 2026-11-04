@@ -1,31 +1,29 @@
 package com.flamingo.llp.test;
 
 import com.fazecast.jSerialComm.SerialPort;
-import com.flamingo.comm.llp.core.*;
+import com.flamingo.comm.llp.*;
 
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 import java.util.List;
 
 /**
- * Serial communication test with an Arduino running the LLP protocol v3.
+ * Serial communication test against a device running LLP wire format 4.0.0.
  *
- * <p>Connects to /dev/ttyUSB0 at 115200 baud and sends LLP v3 transport frames.
- * The Arduino responds with text lines (OK/ERR/HB) rather than LLP frames.</p>
+ * <p>Connects to /dev/ttyUSB0 at 115200 baud and sends v4 frames. The device may
+ * answer with LLP frames or with plain text lines (OK/ERR/HB).</p>
  *
- * <p>This test demonstrates the complete v3 API:</p>
+ * <p>Demonstrates the complete v4 API:</p>
  * <ul>
- *     <li>Building layer chains with {@link LLPFrameBuilder}</li>
- *     <li>Wrapping them into transport frames with {@link LLPTransportFramer}</li>
+ *     <li>Encoding frames with {@link LLP#encode(int, byte[])} (channel + payload)</li>
  *     <li>Parsing incoming bytes with {@link LLPIncrementalParser}</li>
- *     <li>Extracting payloads from {@link FinalNode}</li>
+ *     <li>Reading {@link LLPFrame#channel()} and {@link LLPFrame#payloadBytes()}</li>
+ *     <li>Mapping {@link LLPError} to the four wire error codes</li>
  * </ul>
  *
- * <p>Expected Arduino sketch: examples/serial_echo/serial_echo.ino from
- * the llp-protocol (C) repository.</p>
+ * <p>Expected firmware: grbl-llp (C) or the ESP bridge, both on wire 4.0.0.</p>
  */
 public class SerialLLPTest {
 
@@ -74,14 +72,12 @@ public class SerialLLPTest {
 
         // ================= PARSER (RX) =================
         LLPIncrementalParser parser = LLP.incrementalParser()
-                .maxPayloadBytes(4096)
+                .capacity(LLP.MAX_CAPACITY)
                 .timeoutMs(1000)
                 .build();
 
         // ================= TX LOOP =================
         Thread txThread = new Thread(() -> {
-            // Build minimal LLP layer chain. The builder automatically inserts the FinalNode (0x00).
-            LLPFrameBuilder<byte[]> builder = LLP.frameBuilder().build();
             int sequence = 1;
 
             System.out.println("--- Starting TX loop ---");
@@ -91,19 +87,15 @@ public class SerialLLPTest {
                     String message = "Hello from Java #" + sequence;
                     byte[] appPayload = message.getBytes(StandardCharsets.UTF_8);
 
-                    // 1. Build the layer chain: [0x00][payload]
-                    byte[] layerChain = builder.build(ByteBuffer.wrap(appPayload));
+                    // Encode one v4 frame: AA 55 | LEN | CHANNEL | payload | CRC16
+                    byte[] frame = LLP.encode(0, appPayload);
 
-                    // 2. Wrap into a transport frame: [0xAA][0x55][lenL][lenH][payload...][crcL][crcH]
-                    //    with byte stuffing for every 0xAA byte.
-                    byte[] transportFrame = LLPTransportFramer.buildSafe(layerChain);
-
-                    out.write(transportFrame);
+                    out.write(frame);
                     out.flush();
 
-                    System.out.println("[TX] frame " + HexFormat.of().formatHex(transportFrame).toUpperCase()
-                            + "  layerChainLen=" + layerChain.length
-                            + "  transportLen=" + transportFrame.length
+                    System.out.println("[TX] channel=0 frame=" + HexFormat.of().formatHex(frame).toUpperCase()
+                            + "  payloadLen=" + appPayload.length
+                            + "  frameLen=" + frame.length
                             + "  msg=\"" + message + "\"");
 
                     sequence++;
@@ -138,22 +130,19 @@ public class SerialLLPTest {
                 // ---- Poll parsed LLP frames ----
                 List<LLPFrame> frames = parser.pollFrames();
                 for (LLPFrame frame : frames) {
-                    frame.chain().visit(visitor -> visitor
-                            .on(FinalNode.class, node -> {
-                                ByteBuffer payloadBuf = node.getPayload();
-                                byte[] payload = new byte[payloadBuf.remaining()];
-                                payloadBuf.get(payload);
-                                String text = new String(payload, StandardCharsets.UTF_8);
-                                System.out.println("[RX FRAME] payload=\"" + text + "\"  crc=" + frame.crc());
-                            })
-                    );
+                    byte[] payload = frame.payloadBytes();
+                    String text = new String(payload, StandardCharsets.UTF_8);
+                    System.out.println("[RX FRAME] channel=" + frame.channel()
+                            + " payload=\"" + text + "\""
+                            + " hex=" + HexFormat.of().formatHex(payload).toUpperCase()
+                            + " crc=0x" + Integer.toHexString(frame.crc()));
                 }
 
-                // ---- Poll transport errors ----
-                List<TransportErrorCode> errors = parser.pollErrors();
-                for (TransportErrorCode err : errors) {
-                    System.err.println("[RX TRANSPORT ERROR] code=0x" + Integer.toHexString(err.code())
-                            + " desc=" + err.description());
+                // ---- Poll errors ----
+                List<LLPError> errors = parser.pollErrors();
+                for (LLPError err : errors) {
+                    System.err.println("[RX LLP ERROR] " + err.wireName()
+                            + " code=" + err.code() + " desc=" + err.description());
                 }
 
                 // ---- Print raw ASCII responses from Arduino (OK, ERR, HB) ----
