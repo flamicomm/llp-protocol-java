@@ -12,21 +12,64 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 
+/**
+ * Loads the vendored LLP 4.0.0 conformance corpus from the test classpath.
+ *
+ * <p>The JSON files are copied verbatim from {@code llp-spec/vectors/} by
+ * {@code tools/sync-vectors.sh}. {@code VectorManifestTest} checks them against
+ * {@code MANIFEST.sha256}, so the copy cannot drift silently.</p>
+ */
 public final class VectorLoader {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final boolean INCLUDE_SLOW =
-            Boolean.parseBoolean(System.getProperty("llp.test.includeSlow", "false"));
 
     private VectorLoader() {
     }
 
-    public static List<TestVector> loadAll(String resourcePath) throws IOException {
-        return loadAll(resourcePath, false);
+    /**
+     * Loads every case of every vector file under the resource directory.
+     *
+     * @param resourcePath directory on the test classpath, for example {@code llp-vectors}
+     * @return all cases, in file order
+     * @throws IOException if the directory or a file cannot be read
+     */
+    public static List<TestCase> loadAll(String resourcePath) throws IOException {
+        List<TestCase> cases = new ArrayList<>();
+        for (Path file : jsonFiles(resourcePath)) {
+            cases.addAll(loadFile(file));
+        }
+        return cases;
     }
 
-    public static List<TestVector> loadAll(String resourcePath, boolean includeSlow) throws IOException {
-        List<TestVector> result = new ArrayList<>();
+    /**
+     * Loads the cases of the given kind, across every vector file.
+     *
+     * @param resourcePath directory on the test classpath
+     * @param kind         case kind
+     * @return matching cases
+     * @throws IOException if a file cannot be read
+     */
+    public static List<TestCase> loadByKind(String resourcePath, TestCase.Kind kind) throws IOException {
+        return loadAll(resourcePath).stream()
+                .filter(c -> c.kind() == kind)
+                .toList();
+    }
+
+    private static List<TestCase> loadFile(Path path) throws IOException {
+        JsonNode root = MAPPER.readTree(path.toFile());
+        JsonNode spec = root.get("spec");
+        if (spec == null || !"llp/4.0.0".equals(spec.asString())) {
+            throw new IOException("not an LLP 4.0.0 vector file: " + path.getFileName()
+                    + " (stale file from an older corpus? run: mvn clean)");
+        }
+        List<TestCase> cases = new ArrayList<>();
+        for (JsonNode node : root.get("cases")) {
+            cases.add(TestCase.from(path.getFileName().toString(), node));
+        }
+        return cases;
+    }
+
+    private static List<Path> jsonFiles(String resourcePath) throws IOException {
         URL url = Thread.currentThread().getContextClassLoader().getResource(resourcePath);
         if (url == null) {
             throw new IOException("Resource not found on classpath: " + resourcePath);
@@ -41,86 +84,26 @@ public final class VectorLoader {
             throw new IOException("Not a directory: " + root);
         }
         try (Stream<Path> walk = Files.walk(root)) {
-            List<Path> jsonFiles = walk
-                    .filter(p -> p.toString().endsWith(".json"))
-                    .toList();
-            for (Path file : jsonFiles) {
-                loadGroupedFile(file, result, includeSlow);
-            }
+            return walk.filter(p -> p.toString().endsWith(".json")).sorted().toList();
         }
-        return result;
     }
 
-    public static List<TestVector> loadByType(String resourcePath, String type) throws IOException {
-        return loadByType(resourcePath, type, false);
-    }
-
-    public static List<TestVector> loadByType(String resourcePath, String type, boolean includeSlow) throws IOException {
-        return loadAll(resourcePath, includeSlow).stream()
-                .filter(v -> v.type().equals(type))
-                .toList();
-    }
-
-    public static List<TestVector> loadByNames(String resourcePath, String... filenames) throws IOException {
-        return loadByNames(resourcePath, false, filenames);
-    }
-
-    public static List<TestVector> loadByNames(String resourcePath, boolean includeSlow, String... filenames) throws IOException {
-        List<TestVector> result = new ArrayList<>();
-        String prefix = resourcePath.endsWith("/") ? resourcePath : resourcePath + "/";
-        for (String fn : filenames) {
-            URL url = Thread.currentThread().getContextClassLoader().getResource(prefix + fn);
-            if (url == null) continue;
-            try {
-                Path path = Path.of(url.toURI());
-                loadGroupedFile(path, result, includeSlow);
-            } catch (URISyntaxException ignored) {
-            }
+    /**
+     * Directory that holds the vendored corpus, for the manifest check.
+     *
+     * @param resourcePath directory on the test classpath
+     * @return the resolved directory
+     * @throws IOException if it does not exist
+     */
+    public static Path directory(String resourcePath) throws IOException {
+        URL url = Thread.currentThread().getContextClassLoader().getResource(resourcePath);
+        if (url == null) {
+            throw new IOException("Resource not found on classpath: " + resourcePath);
         }
-        return result;
-    }
-
-    public static int countSlowVectors(String resourcePath) throws IOException {
-        List<TestVector> all = loadAll(resourcePath, true);
-        int count = 0;
-        for (TestVector v : all) {
-            if (v.flags().contains("Slow")) count++;
-        }
-        return count;
-    }
-
-    private static void loadGroupedFile(Path file, List<TestVector> out, boolean includeSlow) throws IOException {
-        boolean effectiveIncludeSlow = includeSlow || INCLUDE_SLOW;
-        JsonNode rootNode = MAPPER.readTree(file.toFile());
-        String specVersion = rootNode.get("spec_version").asString();
-        JsonNode vectors = rootNode.get("vectors");
-        if (vectors == null || !vectors.isArray()) return;
-        for (JsonNode vec : vectors) {
-            if (vec.get("type") == null) continue;
-
-            JsonNode flagsNode = vec.get("flags");
-            boolean hasSlow = false;
-            List<String> flags = new ArrayList<>();
-            if (flagsNode != null && flagsNode.isArray()) {
-                for (JsonNode flag : flagsNode) {
-                    String flagVal = flag.asString();
-                    flags.add(flagVal);
-                    if ("Slow".equals(flagVal)) hasSlow = true;
-                }
-            }
-
-            if (!effectiveIncludeSlow && hasSlow) continue;
-
-            JsonNode expected = vec.get("expected");
-            out.add(new TestVector(
-                    specVersion,
-                    vec.get("type").asString(),
-                    vec.get("name").asString(),
-                    vec.get("description").asString(),
-                    vec.get("input"),
-                    expected,
-                    flags
-            ));
+        try {
+            return Path.of(url.toURI());
+        } catch (URISyntaxException e) {
+            throw new IOException("Invalid resource URI: " + url, e);
         }
     }
 }

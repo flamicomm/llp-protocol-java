@@ -1,24 +1,37 @@
 # Protocolo LLP — Implementación en Java
 
 [![Maven Package](https://github.com/flamicomm/llp-protocol-java/actions/workflows/maven-publish.yml/badge.svg)](https://github.com/flamicomm/llp-protocol-java/actions/workflows/maven-publish.yml)
+[![Maven Verify](https://github.com/flamicomm/llp-protocol-java/actions/workflows/maven-verify.yml/badge.svg)](https://github.com/flamicomm/llp-protocol-java/actions/workflows/maven-verify.yml)
 [![Licencia: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Java 21](https://img.shields.io/badge/Java-21-blue)](https://www.oracle.com/java/)
+[![Wire 4.0.0](https://img.shields.io/badge/Wire-4.0.0-blue)](https://github.com/flamicomm/llp-spec/blob/main/docs/SPEC-v4.md)
 [![codecov](https://codecov.io/github/flamicomm/llp-protocol-java/graph/badge.svg?token=BNZ9MLIS2Z)](https://codecov.io/github/flamicomm/llp-protocol-java)
 
-Implementación en **Java 21** de **LLP (Layered Link Protocol)** — un protocolo de comunicación robusto, eficiente y extensible diseñado para la comunicación de dispositivos IoT. LLP está construido en torno a un modelo de cebolla en capas (layered onion model), donde cada trama puede transportar capas de protocolo opcionales sobre la capa de transporte obligatoria.
+Implementación en **Java 21** de **LLP (Lightweight Link Protocol)** wire format
+**4.0.0**: framing sobre enlaces de bytes con errores (UART, RS-485, RF, TCP,
+Bluetooth), con CRC16-CCITT, *byte stuffing*, canal de enrutamiento y timeout
+entre bytes.
+
+La especificación normativa, los vectores de conformidad y la implementación de
+referencia viven en **[llp-spec](https://github.com/flamicomm/llp-spec)**. Esta
+librería es la implementación Java y **no** define el wire.
 
 ---
 
 ## 🚀 Características
 
-* ✅ **Ligero:** Optimizado para entornos limitados y comunicación con microcontroladores.
-* 🧅 **Arquitectura en capas:** Las tramas transportan capas anidadas opcionales (enrutamiento, encriptación, compresión, etc.).
-* 🔌 **Sistema de plugins:** Las nuevas capas se añaden como bibliotecas independientes descubiertas automáticamente vía Java SPI.
-* 🛡️ **Transporte robusto:** Validación CRC16-CCITT, sincronización tolerante al ruido, *byte stuffing* (relleno de bytes), tiempos de espera configurables.
-* 📡 **Agnóstico al transporte:** Funciona sobre UART, RF, RS485, TCP/IP, Bluetooth y cualquier flujo de bytes.
-* ⚡ **Preparado para Streaming:** Análisis incremental byte por byte para transportes basados en interrupciones o streaming.
-* 🧱 **Separación de responsabilidades:** Tuberías independientes de construcción y análisis de tramas — usa solo lo que necesites.
-* 📚 **Completamente documentado:** Javadoc, ejemplos y suite completa de pruebas incluidas.
+* **Ninguna trama corrupta llega a la aplicación:** el payload se entrega solo
+  después de validar el CRC.
+* **Reensamblado rápido:** tras el ruido, la próxima trama aparece en pocas
+  decenas de bytes.
+* **Canal por trama:** un byte de enrutamiento, sin metadatos ni capas.
+* **Tiempo inyectado:** el parser recibe `nowMs`; el timeout es determinista y
+  wrap-safe a 16 bits (máximo 32767 ms).
+* **Cero asignación por byte** en el camino caliente y **cero dependencias de
+  runtime**.
+* **Buffers del llamador:** el parser escribe en tu `byte[]` y el encoder
+  escribe en un `Sink`, así que ninguno necesita un buffer del tamaño de la trama.
+* **Agnóstico al transporte:** UART, TCP, RS-485, radio, lo que entregue bytes.
 
 ---
 
@@ -31,27 +44,21 @@ Implementación en **Java 21** de **LLP (Layered Link Protocol)** — un protoco
 
 ## 📦 Instalación
 
-Añade la dependencia a tu `pom.xml`:
-
 ```xml
 <dependency>
     <groupId>com.flamingo</groupId>
     <artifactId>llp-core</artifactId>
-    <version>3.1.0</version>
+    <version>4.0.0</version>
 </dependency>
 ```
 
 ### Autenticación en GitHub Packages
 
-Esta librería está publicada en GitHub Packages. Se requiere autenticación.
+La librería se publica en GitHub Packages y requiere un token con `read:packages`.
 
-**1. Crea un Token de Acceso Personal (Personal Access Token)**
+**1.** Creá el token en GitHub → Settings → Developer settings → Personal access tokens.
 
-Ve a: GitHub → Settings → Developer Settings → Personal Access Tokens
-
-Crea un token con el permiso `read:packages`.
-
-**2. Configura `~/.m2/settings.xml`**
+**2.** Configurá `~/.m2/settings.xml`:
 
 ```xml
 <servers>
@@ -63,7 +70,7 @@ Crea un token con el permiso `read:packages`.
 </servers>
 ```
 
-**3. Añade el repositorio a tu `pom.xml`**
+**3.** Agregá el repositorio:
 
 ```xml
 <repositories>
@@ -75,156 +82,132 @@ Crea un token con el permiso `read:packages`.
 </repositories>
 ```
 
-**4. Verifica**
-
-```bash
-mvn clean install
-```
-
 ---
 
-## 🏃 Inicio Rápido (Quick Start)
+## 🏃 Inicio rápido
 
-### Construcción de una trama (salida / outbound)
+### Enviar una trama
 
 ```java
-import com.flamingo.comm.llp.core.LLP;
-import com.flamingo.comm.llp.core.LLPFrameBuilder;
+import com.flamingo.comm.llp.LLP;
 
-import java.nio.ByteBuffer;
-
-// Minimal frame — transport layer only, no additional layers
-LLPFrameBuilder<byte[]> builder = LLP.frameBuilder().build();
-
-byte[] frame = builder.build(ByteBuffer.wrap("hello device".getBytes()));
-// uart.write(frame); // Example: send via your preferred transport
+byte[] payload = "G1 X10\n".getBytes(StandardCharsets.US_ASCII);
+byte[] frame = LLP.encode(1, payload);      // canal 1
+// frame = aa 55 07 01 47 31 20 58 31 30 0a e4 27
+serial.write(frame);
 ```
 
-### Análisis incremental de un flujo de datos (entrada / inbound)
+### Recibir tramas (streaming)
 
 ```java
-import com.flamingo.comm.llp.core.LLP;
-import com.flamingo.comm.llp.core.LLPFrame;
-import com.flamingo.comm.llp.core.LLPIncrementalParser;
-import com.flamingo.comm.llp.core.FinalNode;
-import com.flamingo.comm.llp.core.FailureNode;
-import com.flamingo.comm.llp.core.UnknownNode;
-import com.flamingo.comm.llp.core.TransportErrorCode;
+import com.flamingo.comm.llp.*;
 
-LLPIncrementalParser parser = LLP.incrementalParser()
-        .maxPayloadBytes(4096)
+LLPIncrementalParser receiver = LLP.incrementalParser()
+        .capacity(LLP.MAX_CAPACITY)   // 255
         .timeoutMs(2000)
         .build();
 
-// Feed bytes as they arrive from the transport (UART, TCP, etc.)
-// InputStream in = serialPort.getInputStream(); // Example
 int b;
 while ((b = in.read()) != -1) {
-    parser.feed((byte) b);
+    receiver.feed((byte) b);
 
-    for (LLPFrame frame : parser.pollFrames()) {
-        // Navigate the node chain using the visitor pattern
-        frame.chain().visit(visitor -> visitor
-            .on(FinalNode.class, node -> {
-                byte[] payload = new byte[node.getPayload().remaining()];
-                node.getPayload().get(payload);
-                System.out.println("Received: " + new String(payload));
-            })
-            .on(UnknownNode.class, node ->
-                System.out.println("Unknown layer skipped: ID=" + node.getId()))
-            .on(FailureNode.class, node ->
-                System.err.println("Layer failed: ID=" + node.getId()
-                    + " reason=" + node.getErrorReason()))
-        );
+    for (LLPFrame frame : receiver.pollFrames()) {
+        System.out.println("canal " + frame.channel()
+                + " payload " + new String(frame.payloadBytes(), StandardCharsets.UTF_8));
     }
-
-    for (TransportErrorCode error : parser.pollErrors()) {
-        System.err.println("Transport error: " + error);
+    for (LLPError error : receiver.pollErrors()) {
+        System.err.println(error.wireName() + ": " + error.description());
     }
 }
 ```
 
-### Análisis de tramas completas (no streaming)
+### Parser byte a byte (espejo de la API C)
 
 ```java
-LLPFrameParser parser = LLP.frameParser().build();
+LLPParser parser = LLP.parser().capacity(255).timeoutMs(2000).build();
 
-// rawFrame is an LLPRawFrame produced by LLPTransportDeframer
-LLPFrame frame = parser.parse(rawFrame);
+for (byte b : chunk) {
+    switch (parser.feed(b, nowMs)) {
+        case FeedResult.Frame f -> handle(parser.channel(), parser.payload());
+        case FeedResult.Error e -> log(e.value());
+        case FeedResult.None n  -> { }
+    }
+}
 ```
 
-### Uso de plugins de capas
-
-Cuando una librería de capa (ej. `llp-layer-routing`) está presente en el classpath, es descubierta automáticamente vía SPI — no se requiere configuración.
+### Encoder sin buffer de trama
 
 ```java
-// Frame building with layers
-LLPFrameBuilder<byte[]> builder = LLP.frameBuilder()
-        .addLayer(new RoutingLayerBuilder("sensor-42", "zone-north"))   // inner layer
-        .addLayer(new EncryptionLayerBuilder(Algorithm.AES_256_GCM, key)) // outer layer
-        .build();
-
-byte[] frame = builder.build(ByteBuffer.wrap(telemetryData));
-
-// Parsing with layers (handlers discovered automatically via SPI)
-LLPIncrementalParser parser = LLP.incrementalParser().build();
-
-parser.feed(frame);
-LLPFrame parsed = parser.pollFrames().getFirst();
-
-// Access metadata from a specific layer
-parsed.chain().getNode(RoutingNode.class).ifPresent(node -> {
-    System.out.println("Device: " + node.getMetadata().deviceId());
-    System.out.println("Group:  " + node.getMetadata().group());
-});
+LLPEncoder encoder = new LLPEncoder(channel, payloadLength, port::write);
+for (byte b : generatedPayload()) {
+    encoder.payloadByte(b);        // stuffing + CRC en el camino
+}
+encoder.end();
 ```
 
 ---
 
-## 📦 Estructura de la Trama
-
-### Trama de transporte
-
-El envoltorio más externo validado por la capa de transporte:
+## 📦 Estructura de la trama
 
 ```
-[MAGIC 2B][LENGTH 2B][PAYLOAD NB][CRC16 2B]
-```
-
-| Campo | Tamaño | Valor / Descripción |
-| --- | --- | --- |
-| Magic | 2 bytes | `0xAA 0x55` — delimitador de trama |
-| Length | 2 bytes | Tamaño del payload en bytes (little-endian) |
-| Payload | N bytes | Cadena de capas codificada (ver abajo) |
-| CRC16 | 2 bytes | CRC16-CCITT sobre Magic + Length + Payload (LE) |
-
-Se aplica *byte stuffing* a todos los campos excepto Magic: cualquier byte `0xAA` en el flujo se escapa como `0xAA 0x00`. Una secuencia inesperada `0xAA 0x55` dentro de una trama señala un evento de resincronización.
-
-### Payload de capa (dentro de la trama de transporte)
-
-El payload contiene una cadena recursiva de capas opcionales seguida de los datos crudos finales:
-
-```
-[LAYER_ID][META_LENGTH][METADATA ...][  next layer or final  ]
-                                      ↓
-                              [0x00][RAW PAYLOAD BYTES]
+ offset  0      1      2      3        4 .. 3+LEN      4+LEN  5+LEN
+        +------+------+------+------+----------------+------+------+
+        | 0xAA | 0x55 | LEN  | CHAN |    PAYLOAD     | CRC_L| CRC_H|
+        +------+------+------+------+----------------+------+------+
+          magia (nunca stuffed)     LEN bytes           little-endian
 ```
 
 | Campo | Tamaño | Descripción |
 | --- | --- | --- |
-| Layer ID | 1 byte | Identifica la capa. `0` = payload final. Ver reglas abajo. |
-| Meta length | 1–3 bytes | Tamaño de los metadatos. Valores `0–254` usan 1 byte; `≥255` usan `0xFF` + 2 bytes (big-endian) |
-| Metadata | N bytes | Metadatos específicos de la capa (definidos por cada librería de capa) |
-| Payload | Resto | Siguiente capa o bytes crudos finales |
+| Magic | 2 | `0xAA 0x55`, nunca stuffed |
+| LEN | 1 | Longitud del payload, `0..255` |
+| CHANNEL | 1 | Etiqueta de enrutamiento, `0..255` |
+| PAYLOAD | `LEN` | Bytes opacos de la aplicación |
+| CRC16 | 2 | CRC16-CCITT-FALSE sobre `magic + LEN + CHANNEL + PAYLOAD`, LE |
 
-#### Reglas de Layer ID (ID de Capa)
+Todo byte desde `LEN` en adelante se *stuffea*: `0xAA` se envía como `0xAA 0x00`.
+`0xAA 0x55` dentro de una trama es un **resync**; `0xAA` seguido de otra cosa es
+un **error de sincronización**. `LEN == 0` es válido.
 
-| Rango de ID | Significado |
+| | Bytes |
 | --- | --- |
-| `0` | **Final node (Nodo final)** — no hay más capas; los bytes restantes son el payload crudo de la aplicación. |
-| `1–127` | **Passthrough layer (Capa de paso)** — los metadatos pueden omitirse; el contenido del payload no cambia. |
-| `128–254` | **Transform layer (Capa de transformación)** — el payload fue modificado (encriptado, comprimido, etc.); no puede omitirse sin la librería de la capa. |
-| `255` | **Reservado** — reservado para uso futuro; los parsers deben tratarlo como desconocido y saltarlo si es posible. |
+| Trama mínima (payload vacío, sin stuffing) | 6 |
+| Trama con `n` bytes sin `0xAA` | `6 + n` |
+| Peor caso | `10 + 2n` (`LLP.frameSize(n)`) |
+
+## 📡 Canales
+
+`CHANNEL` es opaco para el protocolo. Una convención que funciona:
+
+| Canal | Uso sugerido |
+| ---: | --- |
+| `0` | stream de comandos de texto por defecto |
+| `1` | comandos binarios |
+| `2` | telemetría |
+| `3` | logs |
+| `4..239` | definido por la aplicación |
+| `240..255` | reservado |
+
+El ruteo por canal es responsabilidad de la aplicación: el core entrega
+`(channel, payload)` y vos decidís a quién se lo das. Hay un ejemplo de
+dispatcher de canales en [`examples/llp-serial-test`](examples/llp-serial-test).
+
+## ⚠️ Errores
+
+| Enum | Código | Causa | Recuperación |
+| --- | ---: | --- | --- |
+| `LLPError.CRC` | 1 | CRC inválido en una trama completa | trama descartada |
+| `LLPError.LEN` | 2 | `LEN` mayor que la capacidad del parser | rechazada al leer `LEN` |
+| `LLPError.TIMEOUT` | 3 | gap entre bytes mayor que `timeoutMs` | el byte se reexamina como magia |
+| `LLPError.SYNC` | 4 | escape inválido o magia nueva dentro de una trama | `AA 55` arranca la nueva trama |
+
+`LLPError.wireName()` devuelve el nombre que usan los vectores
+(`LLP_ERR_CRC`, …), así los logs se pueden cruzar con la especificación.
+
+Los errores son **eventos**, no estados fatales: después de uno, el parser está
+listo para la próxima trama. No se lanzan excepciones por errores de wire;
+`LLPException` es solo para uso incorrecto de la API (payload > 255, canal fuera
+de rango, configuración inválida).
 
 ---
 
@@ -232,319 +215,127 @@ El payload contiene una cadena recursiva de capas opcionales seguida de los dato
 
 ```
 com.flamingo.comm.llp/
-│
-├── core/                          # Core library — transport + layer parsing
-│   ├── LLP.java                   # Static entry point and factory
-│   ├── LLPFrameBuilder.java       # Outbound frame builder interface
-│   ├── LLPFrameParser.java        # Inbound frame parser interface
-│   ├── LLPIncrementalParser.java  # Streaming/incremental inbound parser
-│   ├── LLPTransportFramer.java    # Transport framing (magic, CRC, stuffing)
-│   ├── LLPTransportDeframer.java  # Transport deframing state machine
-│   ├── LLPFrame.java              # Parsed frame with node chain
-│   ├── LLPRawFrame.java           # Transport-level validated frame
-│   ├── NodeChain.java             # Immutable ordered chain of nodes
-│   ├── NodeVisitor.java           # Type-safe visitor for node traversal
-│   ├── FinalNode.java             # Terminal node (raw payload)
-│   ├── UnknownNode.java           # Skipped unknown passthrough layer
-│   ├── FailureNode.java           # Failed-to-parse layer node
-│   ├── ByteArrayFrameBuilder.java # Default frame builder (byte[] output)
-│   ├── CoreParseErrorReason.java  # Core-level parse error reasons
-│   ├── TransportErrorCode.java    # Transport-level error codes
-│   ├── FrameBuildException.java   # Exception for frame build failures
-│   ├── LayerParserProvider.java    # Functional interface for parser lookup
-│   ├── LayerParserRegistry.java   # SPI-based layer parser registry
-│   └── SimpleFrameParser.java     # Internal default frame parser
-│
-├── spi/                           # SPI contracts for layer plugins
-│   ├── LLPLayerParser.java        # Interface for inbound layer parsing
-│   ├── LLPLayerBuilder.java       # Interface for outbound layer building
-│   ├── LLPNode.java               # Base node interface
-│   ├── LayerParseResult.java      # Sealed result type (Success | Failure)
-│   ├── LayerBuildResult.java      # Sealed result type (Success.UnmodifiedPayload | Success.TransformedPayload | Failure)
-│   ├── LayerParseInput.java       # Read-only metadata + payload for parsing
-│   ├── LayerBuildPayload.java      # Read-only payload for building
-│   ├── ParseErrorReason.java      # Interface for parse error reasons
-│   └── BuildErrorReason.java      # Interface for build error reasons
-│
-└── util/                          # Internal utilities
-    ├── ByteWriter.java            # Utility for writing byte sequences
-    ├── CRC16CCITT.java            # CRC16-CCITT calculation
-    ├── LayerIds.java              # Layer ID rules and classification
-    └── Statistics.java            # Transport statistics tracking
+├── LLP.java                    # fachada: parser(), incrementalParser(), encode()
+├── LLPParser.java              # parser byte a byte (espejo de llp4_parser_t)
+├── LLPEncoder.java             # encoder en streaming + encode() de conveniencia
+├── FeedResult.java             # Frame | Error | None (sellado)
+├── LLPFrame.java               # record (channel, payload read-only, crc, receivedAt)
+├── LLPError.java               # los cuatro códigos de wire
+├── LLPException.java           # uso incorrecto de la API
+├── LLPIncrementalParser.java   # capa pull-based con clock inyectable
+└── util/
+    ├── CRC16CCITT.java         # CRC16-CCITT con tabla de 256
+    └── Statistics.java         # contadores por parser
 ```
 
-### Puntos de entrada
+No hay paquete `spi` ni registro de capas: el payload es opaco y la aplicación
+decide qué hacer con él.
 
-`LLP` expone tres métodos de fábrica independientes — usa solo lo que tu caso de uso requiera:
+### Garantías del parser
 
-```java
-// Outbound only — build and serialize frames
-LLPFrameBuilder<byte[]> builder = LLP.frameBuilder()
-        .addLayer(...)
-        .build();
-
-// Inbound only — parse complete LLPRawFrame objects
-LLPFrameParser parser = LLP.frameParser()
-        .parserProvider(customProvider) // optional; defaults to SPI discovery
-        .build();
-
-// Inbound only — streaming, byte-by-byte, pull-based
-LLPIncrementalParser incremental = LLP.incrementalParser()
-        .maxPayloadBytes(8192)
-        .timeoutMs(1000)
-        .build();
-```
-
-### Tubería de entrada (Inbound pipeline)
-
-```
-byte stream
-    └── LLPTransportDeframer   (sync · unstuffing · CRC validation)
-          └── LLPRawFrame
-                └── SimpleFrameParser   (layer chain parsing via SPI registry)
-                      └── LLPFrame  →  NodeChain  →  [Node, Node, ..., FinalNode]
-```
-
-### Tubería de salida (Outbound pipeline)
-
-```
-ByteBuffer payload
-    └── ByteArrayFrameBuilder   (applies layer builders in order)
-          └── byte[] (layered payload)
-                └── LLPTransportFramer   (magic · length · stuffing · CRC)
-                      └── byte[] (transport frame ready to transmit)
-```
+1. **Ningún efecto antes del CRC.** Ningún byte del payload es observable antes
+   de que `READ_CRC_H` acepte la trama.
+2. **O(1) por byte.** Sin bucles que dependan del contenido.
+3. **Memoria acotada.** Un parser nunca guarda más de `capacity` bytes.
+4. **Rechazo temprano de longitud.** `LEN` se valida antes de almacenar payload.
+5. **Reentrancy.** Un parser por enlace, alimentado desde un solo contexto.
+6. **Tiempo inyectado.** El parser nunca lee un reloj.
 
 ---
 
-## 🔌 Sistema de Plugins (SPI)
+## ✅ Conformidad
 
-Las nuevas capas de protocolo se implementan como módulos de Maven independientes. La librería base las descubre en tiempo de ejecución utilizando el `ServiceLoader` de Java — no se requiere registro manual.
+Los tests ejecutan el corpus oficial de
+[llp-spec/vectors](https://github.com/flamicomm/llp-spec/tree/main/vectors):
+**161 casos** en 7 archivos, copiados a `src/test/resources/llp-vectors/` con su
+`MANIFEST.sha256`.
 
-### Creación de un plugin de capa
+| Suite | Casos |
+| --- | ---: |
+| `EncodeVectorTest` | 60 |
+| `DecodeVectorTest` | 88 |
+| `StreamVectorTest` | 13 |
+| `VectorManifestTest` | 1 (sha256 de los 7 archivos) |
 
-**1. Añade la dependencia base (core)**
+Actualizar la copia del corpus:
 
-```xml
-<dependency>
-    <groupId>com.flamingo</groupId>
-    <artifactId>llp-core</artifactId>
-    <version>3.1.0</version>
-</dependency>
+```bash
+tools/sync-vectors.sh ../llp-spec
 ```
 
-**2. Implementa `LLPLayerParser` (entrada)**
-
-```java
-public class RoutingLayerParser implements LLPLayerParser {
-
-    public static final int LAYER_ID = 45; // 1–127: passthrough
-
-    @Override
-    public int getLayerId() { return LAYER_ID; }
-
-    @Override
-    public LayerParseResult parse(LayerParseInput input) {
-        MetadataReader reader = MetadataReader.wrap(input.metadata());
-        try {
-            String deviceId = reader.readUtf8(reader.readUInt8());
-            String group    = reader.readUtf8(reader.readUInt8());
-            int    ttl      = reader.readUInt8();
-
-            return new LayerParseResult.Success(
-                new RoutingNode(new RoutingMetadata(deviceId, group, ttl)),
-                input.payload()  // passthrough: payload unchanged
-            );
-        } catch (Exception e) {
-            return new LayerParseResult.Failure(
-                MyErrorReason.INVALID_METADATA
-            );
-        }
-    }
-}
-```
-
-> **Nota:** `LayerParseResult.Success` y `LayerParseResult.Failure` son records internos de la sealed interface `LayerParseResult`. Usa sus constructores directamente. Para errores, puedes implementar `ParseErrorReason` con tus propios enums, o usar `CoreParseErrorReason` del paquete `core`.
-
-**3. Implementa `LLPLayerBuilder` (salida)**
-
-```java
-public class RoutingLayerBuilder implements LLPLayerBuilder {
-
-    private final String deviceId;
-    private final String group;
-
-    public RoutingLayerBuilder(String deviceId, String group) {
-        this.deviceId = deviceId;
-        this.group    = group;
-    }
-
-    @Override
-    public int getLayerId() { return RoutingLayerParser.LAYER_ID; }
-
-    @Override
-    public LayerBuildResult build(LayerBuildPayload payload) {
-        byte[] deviceIdBytes = deviceId.getBytes(StandardCharsets.UTF_8);
-        byte[] groupBytes    = group.getBytes(StandardCharsets.UTF_8);
-
-        byte[] metadata = MetadataWriter.create()
-                .writeUInt8(deviceIdBytes.length).writeBytes(deviceIdBytes)
-                .writeUInt8(groupBytes.length).writeBytes(groupBytes)
-                .writeUInt8(3)  // TTL default
-                .toBytes();
-
-        // Passthrough: payload is not modified
-        return new LayerBuildResult.Success.UnmodifiedPayload(ByteBuffer.wrap(metadata));
-    }
-}
-```
-
-**4. Registro vía SPI**
-
-Crea el archivo `src/main/resources/META-INF/services/com.flamingo.comm.llp.spi.LLPLayerParser`:
-
-```
-com.example.llp.routing.RoutingLayerParser
-```
-
-La librería base lo descubrirá y registrará automáticamente al inicio.
-
-### Asignación de Layer ID
-
-| Rango | Tipo | Comportamiento del Payload | Requiere SPI para decodificar |
-| --- | --- | --- | --- |
-| `1–127` | Passthrough | Sin cambios — puede omitirse | No |
-| `128–254` | Transform | Modificado (encriptado/comprimido) | Sí |
-| `255` | Reservado | Tratado como desconocido y saltado | No |
-
----
-
-## 🧩 Tipos de Nodos
-
-Tras el análisis, el `NodeChain` de la trama contiene una secuencia ordenada de nodos desde el más externo al más interno:
-
-| Tipo de nodo | Cuándo se crea | Métodos clave |
-| --- | --- | --- |
-| `LLPNode` | Implementaciones SPI (capas personalizadas) | `getId()` |
-| `FinalNode` | Siempre — marca el final de la cadena con bytes crudos | `getId()`, `getPayload()` |
-| `UnknownNode` | El Layer ID no tiene manejador y es de tipo passthrough o reservado | `getId()`, `getMetadata()` |
-| `FailureNode` | Falló el análisis de la capa (error de plugin, metadatos corruptos o falta de FinalNode) | `getId()`, `getErrorReason()`, `getCause()`, `getMetadata()` |
-
-### Navegación por la cadena
-
-```java
-// Option A — visitor pattern (recommended for production code)
-frame.chain().visit(visitor -> visitor
-    .on(FinalNode.class, node -> handlePayload(node.getPayload()))
-    .on(UnknownNode.class, node ->
-        System.out.println("Skipped layer " + node.getId()))
-    .on(FailureNode.class, node ->
-        System.err.println("Failed layer " + node.getId()
-            + ": " + node.getErrorReason()))
-);
-
-// Option B — find a specific node type
-frame.chain().getNode(RoutingNode.class)
-     .ifPresent(n -> route(n.getMetadata().deviceId()));
-
-// Option C — find a node by layer ID
-frame.chain().getNode(45)
-     .ifPresent(n -> System.out.println("Routing node: " + n));
-
-// Option D — access the raw payload directly (innermost node)
-LLPNode deepest = frame.chain().getDeepestNode();
-if (deepest instanceof FinalNode final) {
-    process(final.getPayload());
-}
-```
-
----
-
-## 🔄 Migración desde v2.x
-
-La versión 3 introduce un nuevo modelo de tramas en capas y una API pública rediseñada. La API de la v2 ha sido eliminada.
-
-| v2.x | v3.x |
-| --- | --- |
-| `LLP.newParser()` | `LLP.incrementalParser().build()` |
-| `parser.processByte(b)` | `parser.feed(b)` + `parser.pollFrames()` |
-| `parser.addListener(...)` | Maneja los resultados desde `pollFrames()` / `pollErrors()` |
-| `LLP.buildData(type, payload)` | `LLP.frameBuilder().build()` + `.build(payload)` |
-| `LLPFrame.getType()` | Eliminado — el tipo de mensaje es ahora un asunto de la capa |
-| `LLPFrame.getId()` | Eliminado — el ID de transacción es ahora un asunto de la capa |
-| `LLPMessageType` | Eliminado — define los tipos de mensajes en tu capa |
-| Formato de trama única | Modelo de cebolla en capas (layered onion model) con capas opcionales |
-
-El formato de la trama cambió significativamente en la v3 para soportar el modelo de capas. Las tramas v2 y v3 **no son compatibles a nivel de red (wire-compatible)**.
+El script copia y verifica el manifiesto; `VectorManifestTest` vuelve a
+verificarlo en cada build, así que una copia parcial o editada a mano falla.
 
 ---
 
 ## 🧪 Pruebas
 
 ```bash
-# Run unit and integration tests
-mvn test
-
-# Run tests with coverage report
-mvn verify
-
-# Run tests including slow timing vectors
-mvn test -Pslow-tests
+mvn test          # 229 ejecuciones
+mvn verify        # + javadoc, jar de fuentes y cobertura JaCoCo
 ```
 
-La suite de pruebas cubre:
+La suite cubre el parser (invariantes, cuatro errores, timeout, wrap de 16 bits),
+el encoder (los tres sitios de stuffing, límites, streaming), el receptor
+(chunks, clock, polling) y los 161 vectores de conformidad. Ningún test duerme:
+el tiempo se simula con `dt_ms`.
 
-* *Framing* y *deframing* de transporte (incluyendo byte stuffing, CRC, timeouts, recuperación de sincronización).
-* Análisis de cadena de capas (capas conocidas, desconocidas y con fallos).
-* Construcción de tramas con una o múltiples capas.
-* Análisis incremental (streaming) a través de los tres métodos `feed()`.
-* Registro SPI (detección de duplicados, registro manual, descubrimiento SPI).
-* Casos límite (edge cases): payloads vacíos, longitudes de metadatos extendidas, fallos no omitibles (non-skippable).
-* Vectores de prueba de especificación LLP: 199 vectores oficiales que validan conformancia wire-compatible.
+---
+
+## 🔄 Migración desde 3.x
+
+v4 **no es compatible a nivel de wire** con 3.x y la API pública cambió. La 3.x
+queda en la rama `main` con tag `v3.1.0`.
+
+| 3.x | 4.0.0 |
+| --- | --- |
+| `LLP.frameBuilder().addLayer(...)` + `.build(payload)` | `LLP.encode(channel, payload)` |
+| `LLP.incrementalParser().maxPayloadBytes(4096)` | `.capacity(255)` |
+| `parser.feed(b)` (reloj interno) | `parser.feed(b, nowMs)` o clock inyectable |
+| `LLPFrame.chain()` + `FinalNode` | `frame.channel()` + `frame.payloadBytes()` |
+| `LLPRawFrame` + `LLPFrame` | un solo `LLPFrame` |
+| `TransportErrorCode` (8 valores) | `LLPError` (4 valores de wire) |
+| `LLPTransportDeframer` / `LLPTransportFramer` | `LLPParser` / `LLPEncoder` |
+| Capas, SPI, `NodeChain`, `NodeVisitor` | eliminados: el payload es opaco |
+| slf4j | sin dependencias |
+
+El payload ya no incluye el marcador `FinalNode` (`0x00`): en v4 lo que enviás
+es exactamente lo que llega.
 
 ---
 
 ## 📊 Notas de rendimiento
 
-* Cero copias intermedias durante la creación de tramas de transporte (`LLPTransportFramer`).
-* Una única asignación de memoria para el array final de la trama en `ByteArrayFrameBuilder`.
-* Uso intensivo de `ByteBuffer.slice()` y `duplicate()` para evitar copias de datos durante el análisis (parsing).
-* `NodeChain.Builder` perezoso (lazy) — sin asignación de memoria hasta que se añade el primer nodo.
-* Resultados inmutables — todos los objetos analizados son seguros para compartir entre hilos (threads) después de su creación.
+* Sin asignación por byte en el camino caliente: `FeedResult.NONE` y
+  `FeedResult.FRAME` son singletons; solo los errores crean un objeto.
+* `LLPParser.payload()` es una vista read-only sobre el buffer, sin copia.
+* `LLPFrame` copia el payload una sola vez, al entregar (necesario para que sea
+  inmutable).
+* `LLPEncoder` no reserva una trama: escribe al `Sink` a medida que produce.
+* `LLP.frameSize(n)` reserva el peor caso (`10 + 2n`) si necesitás el buffer.
 
 ---
 
 ## 🤝 Contribuir
 
-Las contribuciones son bienvenidas:
-
-1. Haz un Fork del repositorio.
-2. Crea una rama (`feature/nueva-caracteristica`).
-3. Haz un Commit con tus cambios.
-4. Haz Push y abre un Pull Request.
-
-Todo el código, comentarios, Javadoc y nombres de variables deben escribirse en **Inglés**.
+1. Hacé un fork y creá una rama (`feature/nueva-caracteristica`).
+2. Los cambios de wire van primero a
+   [llp-spec](https://github.com/flamicomm/llp-spec) (spec + vectores) y después
+   acá.
+3. Código, comentarios, Javadoc y nombres en **inglés**.
+4. `mvn verify` en verde.
 
 ---
 
 ## 📜 Licencia
 
-Licencia MIT — ver [LICENSE](LICENSE)
+MIT — ver [LICENSE](LICENSE).
 
-LLP Specification v3.1.0 — Copyright © 2026 Flamingo Communications
-
-This specification is maintained as the authoritative reference for the LLP protocol. All implementations should reference this document as the canonical behaviour definition.
+LLP Specification v4.0.0 — Copyright © 2026 Flamingo Communications
 
 ---
 
-## ✍️ Autor
-
-Creado por **Famingo Communications**
-
----
-
-**Versión:** 3.1.0
-
-**Última actualización:** 2026-05-17
-
+**Versión:** 4.0.0
+**Wire format:** 4.0.0
+**Especificación:** [llp-spec](https://github.com/flamicomm/llp-spec/blob/main/docs/SPEC-v4.md)
 **Objetivo Java:** 21+

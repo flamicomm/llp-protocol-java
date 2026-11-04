@@ -1,65 +1,65 @@
 package com.flamingo.comm.llp.util;
 
-import java.util.concurrent.atomic.AtomicLong;
-
 /**
- * LLP parser statistics.
- * Thread-safe with AtomicLong.
+ * Counters for one parser instance.
+ *
+ * <p>Plain {@code long} fields on purpose: a parser belongs to a single link and
+ * a single context (main loop or ISR, never both), so atomicity would only add
+ * cost. Read them from the same thread that feeds the parser.</p>
  */
-public class Statistics {
-    private final AtomicLong framesOk = new AtomicLong(0);
-    private final AtomicLong framesError = new AtomicLong(0);
-    private final AtomicLong timeouts = new AtomicLong(0);
-    private final long createdAt = System.currentTimeMillis();
+public final class Statistics {
 
+    private long framesOk;
+    private long framesError;
+    private long timeouts;
+
+    /** Records a delivered frame. */
     public void recordSuccess() {
-        framesOk.incrementAndGet();
+        framesOk++;
     }
 
+    /** Records a rejected frame. */
     public void recordError() {
-        framesError.incrementAndGet();
+        framesError++;
     }
 
+    /** Records an inter-byte timeout. */
     public void recordTimeout() {
-        timeouts.incrementAndGet();
+        timeouts++;
     }
 
-    public long getFramesOk() {
-        return framesOk.get();
+    /**
+     * Frames delivered since the last {@link #reset()}.
+     *
+     * @return the count
+     */
+    public long framesOk() {
+        return framesOk;
     }
 
-    public long getFramesError() {
-        return framesError.get();
+    /**
+     * Frames rejected since the last {@link #reset()}.
+     *
+     * @return the count
+     */
+    public long framesError() {
+        return framesError;
     }
 
-    public long getTimeouts() {
-        return timeouts.get();
+    /**
+     * Inter-byte timeouts since the last {@link #reset()}; always a subset of
+     * {@link #framesError()}.
+     *
+     * @return the count
+     */
+    public long timeouts() {
+        return timeouts;
     }
 
-    public long getTotalFrames() {
-        return framesOk.get() + framesError.get();
-    }
-
-    public double getSuccessRate() {
-        long total = getTotalFrames();
-        return total == 0 ? 0.0 : (double) framesOk.get() / total * 100.0;
-    }
-
-    public long getUptimeMs() {
-        return System.currentTimeMillis() - createdAt;
-    }
-
+    /** Clears every counter. */
     public void reset() {
-        framesOk.set(0);
-        framesError.set(0);
-        timeouts.set(0);
-    }
-
-    @Override
-    public String toString() {
-        return String.format(
-                "Statistics{framesOk=%d, framesError=%d, timeouts=%d, successRate=%.2f%%, uptimeMs=%d}",
-                getFramesOk(), getFramesError(), getTimeouts(), getSuccessRate(), getUptimeMs()
-        );
+        framesOk = 0;
+        framesError = 0;
+        timeouts = 0;
     }
 }
