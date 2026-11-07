@@ -32,6 +32,9 @@ librería es la implementación Java y **no** define el wire.
 * **Buffers del llamador:** el parser escribe en tu `byte[]` y el encoder
   escribe en un `Sink`, así que ninguno necesita un buffer del tamaño de la trama.
 * **Agnóstico al transporte:** UART, TCP, RS-485, radio, lo que entregue bytes.
+* **Perfil R1 opcional:** canal de comandos confiable (SEQ + ACK) con
+  deduplicación, para que una trama perdida no deje al emisor esperando ni se
+  ejecute un comando dos veces.
 
 ---
 
@@ -192,6 +195,48 @@ El ruteo por canal es responsabilidad de la aplicación: el core entrega
 `(channel, payload)` y vos decidís a quién se lo das. Hay un ejemplo de
 dispatcher de canales en [`examples/llp-serial-test`](examples/llp-serial-test).
 
+## 🔗 Perfil R1 (canal de comandos confiable)
+
+El wire format v4 no garantiza **entrega**: una trama perdida deja al emisor
+esperando y reintentar a ciegas puede ejecutar un comando dos veces. El perfil
+opcional **R1** (normativo en
+[llp-spec/docs/RELIABILITY.md](https://github.com/flamicomm/llp-spec/blob/main/docs/RELIABILITY.md))
+lo resuelve con dos canales y un marcador de sesión:
+
+```
+COMMAND (canal 1):  [SEQ][DATA...]      emisor -> receptor
+ACK     (canal 2):  [SEQ]               receptor -> emisor
+HELLO   (canal 3):  [SESSION]           inicio de sesión, resetea el dedup
+```
+
+* **Ventana 1**: un comando en vuelo; el siguiente no sale hasta el ACK.
+* **Reintento byte-idéntico**: el receptor deduplica por `SEQ`, así un ACK
+  perdido nunca ejecuta dos veces (importante con `G91`).
+* **HELLO** antes del primer comando de una sesión: el emisor reinicia su `SEQ`
+  y el receptor olvida el último, sin falsos duplicados.
+* El ACK es de **transporte**: no reemplaza el `ok`/`error` de la aplicación.
+
+```java
+LLPRelaySender sender = new LLPRelaySender();
+LLPRelayReceiver receiver = new LLPRelayReceiver();
+
+// emisor
+if (sender.start(seq, line, nowMs)) {
+    link.write(LLP.encode(LLPProfileR1.CH_COMMAND, sender.payload()));
+}
+switch (sender.service(nowMs)) {
+    case SEND -> link.write(LLP.encode(LLPProfileR1.CH_COMMAND, sender.payload()));
+    case EXHAUSTED -> reportNotAcknowledged();
+    case IDLE -> { }
+}
+
+// receptor (payload = [SEQ][DATA])
+if (receiver.accept(payload[0])) {
+    deliver(payload, 1, payload.length - 1);
+}
+link.write(LLP.encode(LLPProfileR1.CH_ACK, LLPProfileR1.ackPayload(payload[0])));
+```
+
 ## ⚠️ Errores
 
 | Enum | Código | Causa | Recuperación |
@@ -247,15 +292,19 @@ decide qué hacer con él.
 
 Los tests ejecutan el corpus oficial de
 [llp-spec/vectors](https://github.com/flamicomm/llp-spec/tree/main/vectors):
-**161 casos** en 7 archivos, copiados a `src/test/resources/llp-vectors/` con su
+**170 casos** en 8 archivos, copiados a `src/test/resources/llp-vectors/` con su
 `MANIFEST.sha256`.
 
 | Suite | Casos |
 | --- | ---: |
-| `EncodeVectorTest` | 60 |
-| `DecodeVectorTest` | 88 |
+| `EncodeVectorTest` | 66 |
+| `DecodeVectorTest` | 90 |
 | `StreamVectorTest` | 13 |
-| `VectorManifestTest` | 1 (sha256 de los 7 archivos) |
+| `VectorManifestTest` | 1 (sha256 de los 8 archivos) |
+
+`reliability.json` fija el layout del perfil R1: comandos en el canal 1,
+ACK en el canal 2, HELLO en el canal 3 (incluye `SEQ = 0xAA`, que se stuffea por
+ser payload).
 
 Actualizar la copia del corpus:
 
@@ -271,14 +320,15 @@ verificarlo en cada build, así que una copia parcial o editada a mano falla.
 ## 🧪 Pruebas
 
 ```bash
-mvn test          # 229 ejecuciones
+mvn test          # 264 ejecuciones
 mvn verify        # + javadoc, jar de fuentes y cobertura JaCoCo
 ```
 
 La suite cubre el parser (invariantes, cuatro errores, timeout, wrap de 16 bits),
 el encoder (los tres sitios de stuffing, límites, streaming), el receptor
-(chunks, clock, polling) y los 161 vectores de conformidad. Ningún test duerme:
-el tiempo se simula con `dt_ms`.
+(chunks, clock, polling), el **perfil R1** (ventana, retransmisión idéntica,
+dedup, agotamiento, wrap y las 9 trazas de conformidad) y los 170 vectores del
+corpus. Ningún test duerme: el tiempo se simula con `dt_ms`.
 
 ---
 
