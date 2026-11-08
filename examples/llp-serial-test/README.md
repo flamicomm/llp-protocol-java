@@ -9,7 +9,7 @@ y cómo probar el perfil R1 sin hardware.
 | Clase | Qué hace |
 |---|---|
 | `R1SelfTest` | Prueba de integración **sin hardware**: simula emisor y receptor en memoria con reloj inyectado y verifica las garantías de R1. |
-| `SerialLLPTest` | Demo **con hardware**: habla el perfil R1 de punta a punta contra un dispositivo que lo implemente (grbl-llp o el puente ESP). |
+| `SerialLLPTest` | Demo **con hardware**: habla el perfil R1 de punta a punta contra grbl-llp por USB/serie directo. |
 | `SerialTest` | Herramienta de wire crudo: imprime lo que llega por el puerto, sin LLP. |
 | `SerialLLPShell` | Shell de wire crudo para explorar tramas a mano. |
 
@@ -55,12 +55,16 @@ Escenarios que cubre:
 4. **HELLO resetea el dedup**: `SEQ 7`, HELLO, `SEQ 7` otra vez produce dos
    entregas.
 5. **Wrap 255→0**: ambos comandos se entregan.
+6. **Comando agotado**: se pierden todos los ACK de un comando; el emisor agota
+   los reintentos, quema ese `SEQ` y el comando siguiente sale con `SEQ+1`. El
+   device ve dos `SEQ` distintos y entrega ambos comandos. Sin la quema, el
+   device deduplicaría el segundo en silencio y el escenario falla.
 
 Los checks comparan contadores exactos (ACK, entregas, duplicados, reintentos y
 frames), así que una regresión en `LLPRelaySender` o `LLPRelayReceiver` los hace
 fallar.
 
-## Modo 2 — contra un dispositivo R1
+## Modo 2 — contra grbl-llp por USB/serie directo
 
 ```bash
 $JAVA_HOME/bin/java \
@@ -69,6 +73,10 @@ $JAVA_HOME/bin/java \
 ```
 
 El puerto está fijo en `/dev/ttyUSB0` a 115200 baudios.
+
+Este modo **no funciona a través del puente ESP**: el ESP es el *emisor* R1,
+consume los ACK de CH2 y no los reenvía al PC (que le habla por TCP). La demo
+asume un enlace serie/USB directo al MCU que corre grbl-llp como receptor R1.
 
 ### Drenaje del boot
 
@@ -87,7 +95,12 @@ parser solo producirían errores de sincronización.
      y reescribe el frame byte-idéntico.
    - Los frames de canal 0 se imprimen como texto (`ok`, `error:`, `[MSG...]`).
    - Si se agotan los reintentos, el comando se marca como no entregado.
-3. Al final imprime un resumen con comandos, ACK, reintentos y no entregados.
+   - El `SEQ` se quema **siempre**, entregado o no (`RELIABILITY §4`): reusarlo
+     con otro `DATA` haría que el device deduplique el comando siguiente en
+     silencio y que un ACK tardío cierre la ventana equivocada.
+3. Al cerrar, drena unos 400 ms de canal 0 para imprimir el último
+   `ok`/`error`, y resume comandos, intentados, ACK, reintentos, no entregados y
+   salteados.
 
 El ACK es de **transporte**: no reemplaza el `ok`/`error` de la aplicación, que
 llega por el canal 0.

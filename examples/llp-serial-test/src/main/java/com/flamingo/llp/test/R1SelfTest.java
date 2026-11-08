@@ -18,11 +18,12 @@ import java.util.List;
  * plain millisecond counter injected into both state machines, so the run is
  * deterministic and never sleeps.</p>
  *
- * <p>The five scenarios cover the profile guarantees that matter for safety:
+ * <p>The six scenarios cover the profile guarantees that matter for safety:
  * clean delivery, a lost ACK (retransmission + dedup), a lost command,
- * {@code HELLO} resetting the dedup state and the 255→0 sequence wrap. Each
- * check asserts an exact counter, so breaking the sender or the receiver makes
- * the self-test fail.</p>
+ * {@code HELLO} resetting the dedup state, the 255→0 sequence wrap and an
+ * exhausted command whose SEQ must be burned before the next one. Each check
+ * asserts an exact counter, so breaking the sender or the receiver makes the
+ * self-test fail.</p>
  *
  * <p>Usage: {@code java com.flamingo.llp.test.R1SelfTest}; it prints
  * {@code [PASS]}/{@code [FAIL]} lines and exits 0 or 1.</p>
@@ -42,11 +43,13 @@ public final class R1SelfTest {
         System.out.println("LLP profile R1 self-test (no hardware, injected clock)");
         System.out.println();
 
-        scenarioCleanDelivery();
-        scenarioLostAck();
-        scenarioLostCommand();
-        scenarioHelloResetsDedup();
-        scenarioSequenceWrap();
+        runScenario("scenario 1: clean delivery", R1SelfTest::scenarioCleanDelivery);
+        runScenario("scenario 2: lost ACK", R1SelfTest::scenarioLostAck);
+        runScenario("scenario 3: lost command", R1SelfTest::scenarioLostCommand);
+        runScenario("scenario 4: HELLO resets dedup", R1SelfTest::scenarioHelloResetsDedup);
+        runScenario("scenario 5: sequence wrap 255 -> 0", R1SelfTest::scenarioSequenceWrap);
+        runScenario("scenario 6: exhausted command burns its SEQ",
+                R1SelfTest::scenarioExhaustedThenNext);
 
         System.out.println();
         System.out.println("Checks: " + (checks - failures) + "/" + checks + " passed");
@@ -57,13 +60,29 @@ public final class R1SelfTest {
         System.out.println("RESULT: PASS");
     }
 
+    /**
+     * Runs one scenario and turns a structural failure into a failed check.
+     *
+     * @param label    scenario title
+     * @param scenario scenario body
+     */
+    private static void runScenario(String label, Runnable scenario) {
+        System.out.println("-- " + label + " --");
+        try {
+            scenario.run();
+        } catch (IllegalStateException e) {
+            check(label + " failed structurally: " + e.getMessage(), false);
+        } catch (RuntimeException e) {
+            check(label + " failed structurally: " + e, false);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Scenarios
     // ------------------------------------------------------------------
 
     /** Five commands in a row: five ACKs, five deliveries, no retries. */
     private static void scenarioCleanDelivery() {
-        System.out.println("-- scenario 1: clean delivery --");
         Sim sim = new Sim();
 
         boolean allAcked = true;
@@ -84,7 +103,6 @@ public final class R1SelfTest {
 
     /** The first ACK is lost: one retransmission, one delivery, one final ACK. */
     private static void scenarioLostAck() {
-        System.out.println("-- scenario 2: lost ACK --");
         Sim sim = new Sim();
         sim.device().dropNextAcks(1);
 
@@ -104,7 +122,6 @@ public final class R1SelfTest {
 
     /** The first command frame is lost: retransmission, one delivery. */
     private static void scenarioLostCommand() {
-        System.out.println("-- scenario 3: lost command --");
         Sim sim = new Sim();
         sim.device().dropNextCommands(1);
 
@@ -121,7 +138,6 @@ public final class R1SelfTest {
 
     /** HELLO clears the last SEQ, so reusing 7 after it is a new command. */
     private static void scenarioHelloResetsDedup() {
-        System.out.println("-- scenario 4: HELLO resets dedup --");
         Sim sim = new Sim();
 
         boolean first = sim.sendCommand(7, "G91");
@@ -143,7 +159,6 @@ public final class R1SelfTest {
 
     /** 255 is followed by 0: the wrap must not be mistaken for a duplicate. */
     private static void scenarioSequenceWrap() {
-        System.out.println("-- scenario 5: sequence wrap 255 -> 0 --");
         Sim sim = new Sim();
 
         boolean last = sim.sendCommand(255, "M5");
@@ -157,6 +172,47 @@ public final class R1SelfTest {
                 sim.device().lastSeq() == 0);
         check("commands delivered in order",
                 sim.device().delivered().equals(List.of("M5", "M3")));
+    }
+
+    /**
+     * A command whose ACKs are all lost exhausts the window. The caller must
+     * burn that SEQ: the next command goes out with SEQ+1, so a device that did
+     * receive the first one cannot silently dedup the second and ACK it.
+     */
+    private static void scenarioExhaustedThenNext() {
+        Sim sim = new Sim();
+
+        sim.device().muteAcks(true);
+        boolean first = sim.sendNext("G91");
+        int firstRetries = sim.lastRetries();
+        int deliveredAfterFirst = sim.device().deliveredCount();
+        int firstSeqSeen = sim.device().seenSeqs().get(0);
+        sim.device().muteAcks(false);
+
+        boolean second = sim.sendNext("G90");
+        List<Integer> seqs = sim.device().seenSeqs();
+        int lastSeqSeen = seqs.get(seqs.size() - 1);
+
+        check("first command exhausted (not acknowledged)", !first);
+        check("first command used all fast retries (got " + firstRetries + ")",
+                firstRetries == LLPProfileR1.DEFAULT_MAX_RETRIES);
+        check("first command was delivered once despite the lost ACKs (got "
+                        + deliveredAfterFirst + ")",
+                deliveredAfterFirst == 1);
+        check("second command acknowledged", second);
+        check("exhausted command burned its SEQ (" + firstSeqSeen + " -> "
+                        + lastSeqSeen + ")",
+                lastSeqSeen == ((firstSeqSeen + 1) & 0xFF));
+        check("both SEQ values reached the device as distinct",
+                firstSeqSeen != lastSeqSeen);
+        check("second command delivered too (got "
+                        + sim.device().deliveredCount() + ")",
+                sim.device().deliveredCount() == 2);
+        check("duplicates only from the exhausted retries (got "
+                        + sim.device().duplicates() + ")",
+                sim.device().duplicates() == LLPProfileR1.DEFAULT_MAX_RETRIES);
+        check("commands delivered in order",
+                sim.device().delivered().equals(List.of("G91", "G90")));
     }
 
     // ------------------------------------------------------------------
@@ -195,8 +251,28 @@ public final class R1SelfTest {
         private final List<byte[]> commandFrames = new ArrayList<>();
 
         private long nowMs;
+        private int nextSeq;
         private int acks;
         private int lastRetries;
+
+        /**
+         * Caller discipline used by the production loop: takes the next SEQ,
+         * sends one command and <strong>always</strong> burns that SEQ, even
+         * when the command is not acknowledged.
+         *
+         * @param line command text
+         * @return true when the command was acknowledged
+         */
+        boolean sendNext(String line) {
+            int seq = nextSeq;
+            boolean acked = sendCommand(seq, line);
+            if (!acked) {
+                sender.abort();
+            }
+            // Burn the sequence number whether or not delivery succeeded.
+            nextSeq = (nextSeq + 1) & 0xFF;
+            return acked;
+        }
 
         /**
          * Runs one command until its ACK closes the window or the fast
@@ -256,7 +332,7 @@ public final class R1SelfTest {
             replies.feed(fromDevice, (int) nowMs);
             for (LLPFrame frame : replies.pollFrames()) {
                 byte[] payload = frame.payloadBytes();
-                if (frame.channel() == LLPProfileR1.CH_ACK && payload.length >= 1) {
+                if (frame.channel() == LLPProfileR1.CH_ACK && payload.length == 1) {
                     acks++;
                     sender.onAck(payload[0] & 0xFF);
                 }
@@ -301,11 +377,13 @@ public final class R1SelfTest {
         private final LLPRelayReceiver receiver = new LLPRelayReceiver();
         private final ByteArrayOutputStream responses = new ByteArrayOutputStream();
         private final List<String> delivered = new ArrayList<>();
+        private final List<Integer> seenSeqs = new ArrayList<>();
 
         private int hellos;
         private int acksSent;
         private int dropCommands;
         private int dropAcks;
+        private boolean muteAcks;
 
         /** Drops the next {@code count} command frames (no delivery, no ACK). */
         void dropNextCommands(int count) {
@@ -315,6 +393,11 @@ public final class R1SelfTest {
         /** Drops the next {@code count} ACK frames (the command is delivered). */
         void dropNextAcks(int count) {
             dropAcks = count;
+        }
+
+        /** Drops every ACK while enabled (the command itself is delivered). */
+        void muteAcks(boolean mute) {
+            muteAcks = mute;
         }
 
         /** Feeds bytes written by the host. */
@@ -351,11 +434,15 @@ public final class R1SelfTest {
             }
 
             int seq = payload[0] & 0xFF;
+            seenSeqs.add(seq);
             if (receiver.accept(seq)) {
                 delivered.add(new String(payload, 1, payload.length - 1,
                         StandardCharsets.UTF_8));
             }
 
+            if (muteAcks) {
+                return;
+            }
             if (dropAcks > 0) {
                 dropAcks--;
                 return;
@@ -377,6 +464,10 @@ public final class R1SelfTest {
 
         List<String> delivered() {
             return delivered;
+        }
+
+        List<Integer> seenSeqs() {
+            return seenSeqs;
         }
 
         int duplicates() {
