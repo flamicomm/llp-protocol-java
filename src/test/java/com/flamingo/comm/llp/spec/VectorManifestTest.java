@@ -22,7 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class VectorManifestTest {
 
     private static final String RESOURCE_DIR = "llp-vectors";
-    private static final int EXPECTED_FILES = 7;
+    private static final int EXPECTED_FILES = 8;
 
     @Test
     void vendoredCorpusMatchesItsManifest() throws Exception {
