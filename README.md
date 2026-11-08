@@ -192,8 +192,10 @@ un **error de sincronización**. `LEN == 0` es válido.
 | `240..255` | reservado |
 
 El ruteo por canal es responsabilidad de la aplicación: el core entrega
-`(channel, payload)` y vos decidís a quién se lo das. Hay un ejemplo de
-dispatcher de canales en [`examples/llp-serial-test`](examples/llp-serial-test).
+`(channel, payload)` y vos decidís a quién se lo das. El ejemplo
+[`examples/llp-serial-test`](examples/llp-serial-test) implementa el perfil R1
+de punta a punta (HELLO, ventana de uno, ACK y dedup) e incluye un self-test en
+memoria que corre sin hardware.
 
 ## 🔗 Perfil R1 (canal de comandos confiable)
 
