@@ -3,34 +3,62 @@ package com.flamingo.llp.test;
 import com.fazecast.jSerialComm.SerialPort;
 import com.flamingo.comm.llp.*;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.HexFormat;
 import java.util.List;
 
 /**
- * Serial communication test against a device running LLP wire format 4.0.0.
+ * End-to-end demo of the {@link LLPProfileR1} reliable command channel.
  *
- * <p>Connects to /dev/ttyUSB0 at 115200 baud and sends v4 frames. The device may
- * answer with LLP frames or with plain text lines (OK/ERR/HB).</p>
+ * <p>Connects to /dev/ttyUSB0 at 115200 baud and talks to grbl-llp over a
+ * direct USB/serial link. It does <strong>not</strong> work through the ESP
+ * bridge: the ESP is the R1 <em>sender</em>, consumes the {@code CH_ACK} frames
+ * itself and does not forward them to the PC (which talks to the ESP over
+ * TCP). Unlike {@link SerialTest} and {@link SerialLLPShell}, which are
+ * raw-wire tools on purpose, this class uses the profile end to end:</p>
  *
- * <p>Demonstrates the complete v4 API:</p>
- * <ul>
- *     <li>Encoding frames with {@link LLP#encode(int, byte[])} (channel + payload)</li>
- *     <li>Parsing incoming bytes with {@link LLPIncrementalParser}</li>
- *     <li>Reading {@link LLPFrame#channel()} and {@link LLPFrame#payloadBytes()}</li>
- *     <li>Mapping {@link LLPError} to the four wire error codes</li>
- * </ul>
+ * <ol>
+ *     <li>Opens the port and drains the boot output: the CH340 resets the MCU
+ *     when the port opens, and the firmware prints a banner for a few seconds.
+ *     Those bytes are read and discarded (never fed to the parser).</li>
+ *     <li>Sends {@link LLPProfileR1#CH_HELLO} twice, so losing one of them does
+ *     not lose the session.</li>
+ *     <li>Sends a short list of commands with stop-and-wait: one frame in
+ *     flight, byte-identical retransmissions, {@code CH_ACK} on channel 2 and
+ *     deduplication by {@code SEQ} on the device.</li>
+ *     <li>Prints the channel-0 text ({@code ok}, {@code error:}, {@code [MSG...]})
+ *     and a final summary with commands, ACKs, retransmissions and commands
+ *     that were never acknowledged.</li>
+ * </ol>
  *
- * <p>Expected firmware: grbl-llp (C) or the ESP bridge, both on wire 4.0.0.</p>
+ * <p>Expected firmware: grbl-llp (C) on wire 4.0.0 with profile R1 enabled.</p>
  */
 public class SerialLLPTest {
 
     private static final String PORT_NAME = "/dev/ttyUSB0";
     private static final int BAUD_RATE = 115200;
-    private static final int RESET_DELAY_MS = 2000;
-    private static final int TX_INTERVAL_MS = 3000;
+
+    /** Semi-blocking read timeout while draining the boot banner. */
+    private static final int READ_TIMEOUT_MS = 50;
+
+    /**
+     * Boot drain window. The CH340 pulls DTR when the port opens, resetting the
+     * MCU; the firmware needs a few seconds before it starts listening (F-013,
+     * F-014, F-018).
+     */
+    private static final int BOOT_DRAIN_MS = 4500;
+
+    /**
+     * Bounded drain after the last command. The device ACKs as soon as the line
+     * is accepted into its RX ring, so {@code ok}/{@code error:} usually arrives
+     * a little later and must be read before closing the port.
+     */
+    private static final int FINAL_DRAIN_MS = 400;
+
+    /** Short command list: harmless queries plus one dwell. */
+    private static final List<String> COMMANDS = List.of("$X", "$I", "G4 P0", "$G");
 
     public static void main(String[] args) throws Exception {
 
@@ -41,8 +69,8 @@ public class SerialLLPTest {
         port.setNumStopBits(SerialPort.ONE_STOP_BIT);
         port.setParity(SerialPort.NO_PARITY);
         port.setComPortTimeouts(
-                SerialPort.TIMEOUT_READ_BLOCKING,
-                0,
+                SerialPort.TIMEOUT_READ_SEMI_BLOCKING,
+                READ_TIMEOUT_MS,
                 0
         );
 
@@ -52,8 +80,6 @@ public class SerialLLPTest {
         }
 
         System.out.println("Connected to " + port.getSystemPortName());
-        System.out.println("Waiting for Arduino reset...");
-        Thread.sleep(RESET_DELAY_MS);
 
         InputStream in = port.getInputStream();
         OutputStream out = port.getOutputStream();
@@ -70,107 +96,240 @@ public class SerialLLPTest {
             port.closePort();
         }));
 
+        // ================= BOOT DRAIN =================
+        // Read and drop the reset banner without feeding it to the parser: it
+        // is plain text, not LLP, and would only produce sync errors.
+        int discarded = drainBoot(in);
+        System.out.println("[BOOT] discarded " + discarded + " byte(s) over "
+                + BOOT_DRAIN_MS + " ms");
+
         // ================= PARSER (RX) =================
         LLPIncrementalParser parser = LLP.incrementalParser()
                 .capacity(LLP.MAX_CAPACITY)
-                .timeoutMs(1000)
+                .timeoutMs(LLP.DEFAULT_TIMEOUT_MS)
                 .build();
 
-        // ================= TX LOOP =================
-        Thread txThread = new Thread(() -> {
-            int sequence = 1;
+        // ================= HELLO =================
+        // Sent twice by project convention: the device resets its dedup state
+        // on every HELLO, so losing one of the two is harmless.
+        byte[] hello = LLP.encode(LLPProfileR1.CH_HELLO, LLPProfileR1.helloPayload());
+        for (int i = 0; i < 2; i++) {
+            out.write(hello);
+            out.flush();
+        }
+        System.out.println("[HELLO] sent twice, session=0x"
+                + String.format("%02X", LLPProfileR1.DEFAULT_SESSION));
 
-            System.out.println("--- Starting TX loop ---");
+        // ================= R1 COMMAND LOOP =================
+        // One sender per session: the window is reused by every command. The
+        // sender's fast retries (5 x 50 ms by default) bound each wait, so no
+        // extra wall-clock guard is needed: EXHAUSTED is the failure signal.
+        LLPRelaySender sender = new LLPRelaySender();
+        int seq = 0;
+        int attempted = 0;
+        int skipped = 0;
+        int acked = 0;
+        int retries = 0;
+        int notDelivered = 0;
+        boolean linkClosed = false;
 
-            try {
-                while (!Thread.currentThread().isInterrupted()) {
-                    String message = "Hello from Java #" + sequence;
-                    byte[] appPayload = message.getBytes(StandardCharsets.UTF_8);
+        byte[] readBuffer = new byte[256];
 
-                    // Encode one v4 frame: AA 55 | LEN | CHANNEL | payload | CRC16
-                    byte[] frame = LLP.encode(0, appPayload);
-
-                    out.write(frame);
-                    out.flush();
-
-                    System.out.println("[TX] channel=0 frame=" + HexFormat.of().formatHex(frame).toUpperCase()
-                            + "  payloadLen=" + appPayload.length
-                            + "  frameLen=" + frame.length
-                            + "  msg=\"" + message + "\"");
-
-                    sequence++;
-                    Thread.sleep(TX_INTERVAL_MS);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (Exception ex) {
-                System.err.println("[TX ERROR] " + ex.getMessage());
-                ex.printStackTrace();
+        for (String command : COMMANDS) {
+            if (Thread.currentThread().isInterrupted() || linkClosed) {
+                break;
             }
-        });
 
-        txThread.setDaemon(true);
-        txThread.start();
+            byte[] data = command.getBytes(StandardCharsets.UTF_8);
+            if (!sender.start(seq, data, nowMs())) {
+                // The window should be free here; report it instead of lying
+                // in the summary.
+                skipped++;
+                System.err.println("[SKIP] window busy or payload too long: \"" + command + "\"");
+                continue;
+            }
+            attempted++;
 
-        // ================= RX THREAD =================
-        StringBuilder asciiBuffer = new StringBuilder();
+            byte[] frame = LLP.encode(LLPProfileR1.CH_COMMAND, sender.payload());
+            out.write(frame);
+            out.flush();
+            System.out.println("[CMD] seq=" + seq + " \"" + command + "\"");
 
-        while (!Thread.currentThread().isInterrupted()) {
-            try {
-                int data = in.read();
+            boolean closed = false;
+            boolean exhausted = false;
 
-                if (data < 0) {
-                    // End of stream
+            while (!closed && !exhausted
+                    && !Thread.currentThread().isInterrupted() && !linkClosed) {
+                int n = in.read(readBuffer);
+                if (n < 0) {
+                    // jSerialComm: -1 means the port was closed / end of stream,
+                    // not a read timeout (a timeout returns 0).
+                    System.err.println("[LINK] port closed or end of stream at seq=" + seq);
+                    linkClosed = true;
                     break;
                 }
 
-                byte b = (byte) data;
-                parser.feed(b);
+                // Timestamp after the (possibly blocking) read so service()
+                // sees the real elapsed time.
+                long now = nowMs();
 
-                // ---- Poll parsed LLP frames ----
-                List<LLPFrame> frames = parser.pollFrames();
-                for (LLPFrame frame : frames) {
-                    byte[] payload = frame.payloadBytes();
-                    String text = new String(payload, StandardCharsets.UTF_8);
-                    System.out.println("[RX FRAME] channel=" + frame.channel()
-                            + " payload=\"" + text + "\""
-                            + " hex=" + HexFormat.of().formatHex(payload).toUpperCase()
-                            + " crc=0x" + Integer.toHexString(frame.crc()));
-                }
-
-                // ---- Poll errors ----
-                List<LLPError> errors = parser.pollErrors();
-                for (LLPError err : errors) {
-                    System.err.println("[RX LLP ERROR] " + err.wireName()
-                            + " code=" + err.code() + " desc=" + err.description());
-                }
-
-                // ---- Print raw ASCII responses from Arduino (OK, ERR, HB) ----
-                if (b == '\n') {
-                    String line = asciiBuffer.toString();
-                    if (!line.isEmpty()) {
-                        System.out.println("[RX ASCII] " + line);
+                if (n > 0) {
+                    for (int i = 0; i < n; i++) {
+                        parser.feed(readBuffer[i], (int) now);
                     }
-                    asciiBuffer.setLength(0);
-                } else if (b >= 0x20 && b < 0x7F) {
-                    // Only buffer printable ASCII to avoid garbling from binary LLP bytes
-                    asciiBuffer.append((char) b);
-                } else if (b == '\r') {
-                    // ignore carriage return
-                } else {
-                    // Non-printable byte (part of LLP frame or binary data) —
-                    // discard from ASCII buffer to keep output clean
-                    asciiBuffer.setLength(0);
+                    for (LLPFrame received : parser.pollFrames()) {
+                        byte[] payload = received.payloadBytes();
+                        if (received.channel() == LLPProfileR1.CH_ACK) {
+                            if (payload.length == 1) {
+                                int ackSeq = payload[0] & 0xFF;
+                                if (sender.onAck(ackSeq)) {
+                                    // Only an ACK that actually closed this
+                                    // window counts as delivered.
+                                    closed = true;
+                                    acked++;
+                                    System.out.println("[ACK] seq=" + ackSeq);
+                                }
+                            } else {
+                                System.err.println("[RX] ignored malformed ACK, len="
+                                        + payload.length);
+                            }
+                        } else if (received.channel() == 0) {
+                            System.out.println("[DATA] " + new String(payload, StandardCharsets.UTF_8).trim());
+                        } else {
+                            System.out.println("[RX] channel=" + received.channel()
+                                    + " len=" + payload.length);
+                        }
+                    }
+                    for (LLPError err : parser.pollErrors()) {
+                        System.err.println("[RX LLP ERROR] " + err.wireName()
+                                + " code=" + err.code() + " desc=" + err.description());
+                    }
                 }
 
-            } catch (Exception e) {
-                System.err.println("[WARN] Read error: " + e.getMessage());
+                if (!closed) {
+                    switch (sender.service(now)) {
+                        case SEND -> {
+                            // Byte-identical retransmission: the device dedups by SEQ.
+                            out.write(LLP.encode(LLPProfileR1.CH_COMMAND, sender.payload()));
+                            out.flush();
+                            System.out.println("[RETRY] seq=" + seq + " attempt=" + sender.retries());
+                        }
+                        case EXHAUSTED -> {
+                            exhausted = true;
+                            System.out.println("[EXHAUSTED] seq=" + seq + " not acknowledged");
+                        }
+                        case IDLE -> {
+                            // Still waiting inside the ACK timeout.
+                        }
+                    }
+                }
+            }
+
+            retries += sender.retries();
+
+            // Burn the sequence number whether or not the command was delivered
+            // (RELIABILITY §4). Reusing it with different DATA would make the
+            // device silently dedup the next command, and a late ACK could
+            // close the wrong window. Same discipline as llp_link.py/test_r1.py.
+            seq = (seq + 1) & 0xFF;
+
+            if (!closed) {
+                notDelivered++;
+                sender.abort();
             }
         }
 
+        // Bounded drain so the last command's ok/error is printed before closing.
+        if (!linkClosed && !Thread.currentThread().isInterrupted()) {
+            drainChannelZero(in, parser, FINAL_DRAIN_MS);
+        }
+
+        // ================= SUMMARY =================
+        System.out.println("[SUMMARY] commands=" + COMMANDS.size()
+                + " attempted=" + attempted
+                + " acked=" + acked
+                + " retries=" + retries
+                + " not-delivered=" + notDelivered
+                + " skipped=" + skipped);
+
         // Cleanup
-        txThread.interrupt();
         port.closePort();
         System.out.println("Port closed.");
+    }
+
+    /**
+     * Reads and discards everything the device prints while it boots.
+     *
+     * @param in port input stream with a semi-blocking read timeout
+     * @return number of discarded bytes
+     * @throws IOException if the port read fails
+     */
+    private static int drainBoot(InputStream in) throws IOException {
+        byte[] buffer = new byte[256];
+        long deadline = System.currentTimeMillis() + BOOT_DRAIN_MS;
+        int discarded = 0;
+        while (System.currentTimeMillis() < deadline
+                && !Thread.currentThread().isInterrupted()) {
+            int n = in.read(buffer);
+            if (n < 0) {
+                // Port closed / EOF: nothing left to drain.
+                return discarded;
+            }
+            if (n > 0) {
+                discarded += n;
+            }
+        }
+        return discarded;
+    }
+
+    /**
+     * Drains channel-0 text for a bounded window after the last command.
+     *
+     * <p>The ACK is a transport event and arrives before grbl executes the
+     * line, so {@code ok}/{@code error:} must be read separately. The drain
+     * also prints any remaining {@link LLPError}.</p>
+     *
+     * @param in       port input stream with a semi-blocking read timeout
+     * @param parser   parser fed with the drained bytes
+     * @param windowMs maximum time to keep draining
+     * @throws IOException if the port read fails
+     */
+    private static void drainChannelZero(InputStream in, LLPIncrementalParser parser, int windowMs)
+            throws IOException {
+        byte[] buffer = new byte[256];
+        long deadline = System.currentTimeMillis() + windowMs;
+        while (System.currentTimeMillis() < deadline
+                && !Thread.currentThread().isInterrupted()) {
+            int n = in.read(buffer);
+            if (n < 0) {
+                return;
+            }
+            if (n == 0) {
+                continue;
+            }
+
+            long now = nowMs();
+            for (int i = 0; i < n; i++) {
+                parser.feed(buffer[i], (int) now);
+            }
+            for (LLPFrame received : parser.pollFrames()) {
+                if (received.channel() == 0) {
+                    String text = new String(received.payloadBytes(),
+                            StandardCharsets.UTF_8).trim();
+                    if (!text.isEmpty()) {
+                        System.out.println("[DATA] " + text);
+                    }
+                }
+            }
+            for (LLPError err : parser.pollErrors()) {
+                System.err.println("[RX LLP ERROR] " + err.wireName()
+                        + " code=" + err.code() + " desc=" + err.description());
+            }
+        }
+    }
+
+    /** Monotonic milliseconds for the injected R1 clock. */
+    private static long nowMs() {
+        return System.nanoTime() / 1_000_000L;
     }
 }
